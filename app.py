@@ -377,7 +377,6 @@ def main():
             render_custom_player(video_url, raw_sub_text)
 
             st.divider()
-
             # --- EXTERNAL APP DEEP LINKS (For Mobile Phones) ---
             st.markdown("### 📱 Play in External App (Bypasses CORS)")
             st.caption(
@@ -389,12 +388,15 @@ def main():
             scheme = "https" if clean_video_url.startswith("https") else "http"
             url_no_scheme = clean_video_url.replace(f"{scheme}://", "")
 
-            # 2. Crucial: Determine MIME type so players don't throw playback errors
+            # 2. Set MIME types securely
+            # VLC & MX Player need specific MIME types for m3u8.
+            # MPV strictly requires 'video/*' or Android rejects the intent and opens the Play Store.
             mime_type = (
                 "application/x-mpegURL"
                 if ".m3u8" in clean_video_url.lower()
                 else "video/*"
             )
+            mpv_mime_type = "video/*"
 
             # 3. Escape ampersands for HTML to prevent query parameters from corrupting the intent link
             html_url_no_scheme = url_no_scheme.replace("&", "&amp;")
@@ -407,8 +409,10 @@ def main():
             intent_vlc_ios = (
                 f"vlc-x-callback://x-callback-url/stream?url={quote(clean_video_url)}"
             )
-            intent_mpv = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=is.xyz.mpv;action=android.intent.action.VIEW;type={mime_type}{sub_param};end"
+            intent_mpv = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=is.xyz.mpv;action=android.intent.action.VIEW;type={mpv_mime_type}{sub_param};end"
             intent_mx = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=com.mxtech.videoplayer.ad;action=android.intent.action.VIEW;type={mime_type};end"
+
+            # Chooser intent (Note: If it automatically opens an app, clear that app's defaults in Android Settings)
             intent_chooser = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};action=android.intent.action.VIEW;type={mime_type};end"
 
             st.markdown(
@@ -423,7 +427,6 @@ def main():
             """,
                 unsafe_allow_html=True,
             )
-
         elif platform in ["1", "2", "3"]:
             st.caption(f"{current_ep['label']} — Ready for Local Execution")
             player_name = (
