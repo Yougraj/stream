@@ -1,9 +1,12 @@
+import base64
 import os
+import re
 import subprocess
 from urllib.parse import quote
 
-import requests
+import cloudscraper
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 # --- Try loading the live search plugin ---
@@ -15,11 +18,22 @@ except ImportError:
     HAS_KEYUP = False
 
 # --- Configuration & Metadata ---
-VERSION = "0.0.5 (Live Search Edition)"
+VERSION = "0.0.9 (Mobile Deep Links Edition)"
 BASE_URL = "https://kisskh.buzz/"
 AJAX_URL = BASE_URL + "wp-admin/admin-ajax.php"
 BLOGGER_BLOG_ID = "1422331367239821646"
 BLOGGER_FEED_URL = f"https://www.blogger.com/feeds/{BLOGGER_BLOG_ID}/posts/default"
+
+scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "desktop": True}
+)
+scraper.headers.update(
+    {
+        "Referer": BASE_URL,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+)
 
 # --- State Management Initialization ---
 if "selected_drama" not in st.session_state:
@@ -30,9 +44,81 @@ if "last_query" not in st.session_state:
     st.session_state.last_query = ""
 
 
+# --- Helper Functions ---
+def srt_to_vtt(subtitle_text):
+    if not subtitle_text:
+        return ""
+    text = subtitle_text.strip()
+    if text.startswith("WEBVTT"):
+        return text
+    vtt = "WEBVTT\n\n" + re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", text)
+    return vtt
+
+
+def render_custom_player(video_url, subtitle_text=None):
+    sub_track_js = ""
+    if subtitle_text:
+        vtt_text = srt_to_vtt(subtitle_text)
+        b64_sub = base64.b64encode(vtt_text.encode("utf-8")).decode("utf-8")
+        sub_track_js = f"""
+        const subText = decodeURIComponent(escape(window.atob('{b64_sub}')));
+        const blob = new Blob([subText], {{ type: 'text/vtt' }});
+        const track = document.createElement('track');
+        track.src = URL.createObjectURL(blob);
+        track.kind = 'captions';
+        track.srclang = 'en';
+        track.label = 'English';
+        track.default = true;
+        video.appendChild(track);
+        """
+
+    html_code = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+        <style>
+            body {{ margin: 0; background: #0e1117; color: white; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }}
+            video {{ width: 100%; height: 100%; max-height: 100vh; outline: none; border-radius: 8px; }}
+            #error-msg {{ display: none; color: #ff4b4b; font-family: sans-serif; padding: 20px; text-align: center; line-height: 1.5; }}
+        </style>
+    </head>
+    <body>
+        <div id="error-msg">
+            <b>⚠️ Video Blocked by Server (CORS Error)</b><br><br>
+            The host server prevents this video from playing inside the web browser.<br><br>
+            👇 <b>Scroll down to the "Play in External App" section to open it directly!</b> 👇
+        </div>
+        <video id="video" controls crossorigin="anonymous" playsinline></video>
+        <script>
+            var video = document.getElementById('video');
+            var videoSrc = "{video_url}";
+            {sub_track_js}
+            if (Hls.isSupported() && videoSrc.includes('.m3u8')) {{
+                var hls = new Hls();
+                hls.loadSource(videoSrc);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.ERROR, function (event, data) {{
+                    if (data.fatal) {{
+                        document.getElementById('video').style.display = 'none';
+                        document.getElementById('error-msg').style.display = 'block';
+                    }}
+                }});
+            }} else if (video.canPlayType('application/vnd.apple.mpegurl') || !videoSrc.includes('.m3u8')) {{
+                video.src = videoSrc;
+            }} else {{
+                document.getElementById('video').style.display = 'none';
+                document.getElementById('error-msg').style.display = 'block';
+            }}
+        </script>
+    </body>
+    </html>
+    """
+    components.html(html_code, height=500)
+
+
 @st.cache_data(show_spinner=False)
 def get_search_results(query):
-    """Search for dramas via AJAX and extract thumbnails."""
     if not query:
         return []
     payload = {
@@ -43,7 +129,7 @@ def get_search_results(query):
         "is_popular": "0",
     }
     try:
-        res = requests.post(AJAX_URL, data=payload, timeout=10)
+        res = scraper.post(AJAX_URL, data=payload, timeout=15)
         soup = BeautifulSoup(res.text, "html.parser")
         results = []
         for card in soup.select("a.movie-card"):
@@ -53,74 +139,90 @@ def get_search_results(query):
                 else "Unknown"
             )
             link = card.get("href", "")
-
             ep_tag = card.select_one(".episode")
             ep = ep_tag.get_text(strip=True) if ep_tag else "Movie"
-
             img_tag = card.select_one("img")
-            img_src = None
-            if img_tag:
-                img_src = img_tag.get("data-src") or img_tag.get("src")
-            if not img_src:
-                img_src = "https://via.placeholder.com/300x400.png?text=No+Image"
-
+            img_src = (
+                (img_tag.get("data-src") or img_tag.get("src"))
+                if img_tag
+                else "https://via.placeholder.com/300x400.png?text=No+Image"
+            )
             results.append({"title": title, "link": link, "ep": ep, "img": img_src})
         return results
     except Exception:
         return []
 
 
-@st.cache_data(show_spinner=False)
 def fetch_links(drama_title):
-    """Extracts Video and Subtitle links from Blogger Feed."""
-    feed_url = f"{BLOGGER_FEED_URL}?q={quote(drama_title)}&alt=json&max-results=1"
-    try:
-        data = requests.get(feed_url, timeout=10).json()
-        if "entry" not in data["feed"]:
-            return []
-        content = data["feed"]["entry"][0]["content"]["$t"]
-        eps = []
-        for i, part in enumerate(content.split(";"), 1):
-            if "|" in part:
-                fields = part.split("|")
-                v_url = fields[0].strip()
+    clean_title = re.sub(r"\(.*?\)", "", drama_title)
+    words = re.findall(r"\w+", clean_title)
+    search_queries = []
+    if len(words) >= 4:
+        search_queries.append(" ".join(words[:4]))
+    if len(words) >= 2:
+        search_queries.append(" ".join(words[:2]))
+    if len(words) > 0:
+        search_queries.append(" ".join(words[:1]))
+    search_queries = list(dict.fromkeys(search_queries))
 
-                s_url = ""
-                if len(fields) > 2:
-                    subs = fields[2].strip().split(",")
-                    s_url = subs[0] if subs else ""
-                    if not s_url.startswith("http"):
-                        s_url = ""
+    for sq in search_queries:
+        feed_url = f"{BLOGGER_FEED_URL}?q={quote(sq)}&alt=json&max-results=3"
+        try:
+            data = scraper.get(feed_url, timeout=10).json()
+            if "entry" in data.get("feed", {}):
+                for entry in data["feed"]["entry"]:
+                    raw_content = entry["content"]["$t"]
+                    clean_content = BeautifulSoup(raw_content, "html.parser").get_text()
 
-                if v_url.startswith("http"):
-                    eps.append({"label": f"Episode {i}", "url": v_url, "sub": s_url})
-        return eps
-    except Exception:
-        return []
+                    if "|" in clean_content and "http" in clean_content:
+                        eps = []
+                        for i, part in enumerate(clean_content.split(";"), 1):
+                            if "|" in part:
+                                fields = part.split("|")
+                                v_url = fields[0].strip()
+                                s_url = ""
+                                if len(fields) > 2:
+                                    subs = fields[2].strip().split(",")
+                                    s_url = subs[0] if subs else ""
+                                    if not s_url.startswith("http"):
+                                        s_url = ""
+
+                                if v_url.startswith("http"):
+                                    eps.append(
+                                        {
+                                            "label": f"Episode {i}",
+                                            "url": v_url,
+                                            "sub": s_url,
+                                        }
+                                    )
+
+                        if eps:
+                            return eps
+        except Exception:
+            continue
+    return []
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_subtitle_content(url):
-    """Downloads the raw subtitle text so Streamlit can read it natively."""
     if not url:
         return None
     try:
-        r = requests.get(url, timeout=10)
+        r = scraper.get(url, timeout=15)
         r.raise_for_status()
         content = r.text.strip()
-        if content.startswith("WEBVTT") or "-->" in content:
+        if "-->" in content or content.startswith("WEBVTT"):
             return content
         return None
     except Exception:
         return None
 
 
-def play_video(url, sub_url, platform):
-    """Triggers external players for local OS usage."""
+def play_video_native_local(url, sub_url, platform):
     if not url:
         return
     try:
-        if platform == "1":  # Android (MPV)
+        if platform == "1":
             cmd = [
                 "am",
                 "start",
@@ -136,15 +238,15 @@ def play_video(url, sub_url, platform):
             if sub_url:
                 cmd.extend(["--es", "subs", sub_url])
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif platform == "2":  # iOS (VLC)
+        elif platform == "2":
             os.system(f"open vlc://{url}")
-        elif platform == "3":  # Linux (MPV)
+        elif platform == "3":
             cmd = ["mpv", url]
             if sub_url:
                 cmd.append(f"--sub-file={sub_url}")
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as e:
-        st.error(f"Failed to launch player: {e}")
+        st.error(f"Failed to launch native player: {e}")
 
 
 # --- Streamlit UI Main App ---
@@ -156,9 +258,9 @@ def main():
     st.sidebar.header("⚙️ Configuration")
     platform_map = {
         "Browser (Web Player)": "0",
-        "Android (MPV)": "1",
-        "iOS (VLC)": "2",
-        "Linux (MPV)": "3",
+        "Local Android (Termux)": "1",
+        "Local iOS (Terminal)": "2",
+        "Local Linux (MPV)": "3",
         "URL Only": "4",
     }
     selected_platform_name = st.sidebar.selectbox(
@@ -166,31 +268,24 @@ def main():
     )
     platform = platform_map[selected_platform_name]
 
-    # --- LIVE SEARCH BAR ---
     if HAS_KEYUP:
-        # debounce=500 means it waits half a second after you stop typing to search
         query = st_keyup(
             "🔍 Live Search Drama:",
             placeholder="Start typing a drama name...",
             debounce=500,
         )
     else:
-        st.warning(
-            "⚠️ Live search is disabled. Run `pip install streamlit-keyup` in your terminal to enable it."
-        )
         query = st.text_input(
             "🔍 Search Drama (Press Enter):", placeholder="Type a drama name here..."
         )
 
     st.divider()
 
-    # Reset view if user types a new query
     if query != st.session_state.last_query:
         st.session_state.selected_drama = None
         st.session_state.ep_idx = 0
         st.session_state.last_query = query
 
-    # View 1: Display Grid of Thumbnails
     if query and st.session_state.selected_drama is None:
         with st.spinner("Searching..."):
             results = get_search_results(query)
@@ -211,7 +306,6 @@ def main():
                     st.session_state.ep_idx = 0
                     st.rerun()
 
-    # View 2: Video Player and Episode Navigation
     elif st.session_state.selected_drama is not None:
         selected_drama = st.session_state.selected_drama
 
@@ -219,11 +313,13 @@ def main():
             st.session_state.selected_drama = None
             st.rerun()
 
-        with st.spinner("Fetching episodes..."):
+        with st.spinner("Fetching episodes from Blogger..."):
             episodes = fetch_links(selected_drama["title"])
 
         if not episodes:
-            st.error("No streamable episodes found for this drama.")
+            st.error(
+                f"No streamable episodes found in the database for '{selected_drama['title']}'."
+            )
             return
 
         ep_labels = [e["label"] for e in episodes]
@@ -259,48 +355,74 @@ def main():
                 st.session_state.ep_idx += 1
                 st.rerun()
 
-        # Load Current Episode Data
         current_ep = episodes[st.session_state.ep_idx]
-        has_sub_url = bool(current_ep["sub"])
+        video_url = current_ep["url"]
+        sub_url = current_ep["sub"]
 
         if platform == "0":
-            # NATIVE WEB PLAYER
-            if has_sub_url:
+            # NATIVE BROWSER PLAYER (With HLS support)
+            raw_sub_text = None
+            if sub_url:
                 with st.spinner("Downloading subtitles..."):
-                    raw_sub_text = fetch_subtitle_content(current_ep["sub"])
-
-                if raw_sub_text:
-                    st.caption(f"{current_ep['label']} — ✅ Subtitles Loaded")
-                    try:
-                        st.video(current_ep["url"], subtitles={"English": raw_sub_text})
-                    except Exception:
-                        st.warning(
-                            "⚠️ Streamlit rejected the subtitle format. Playing video without subtitles."
-                        )
-                        st.video(current_ep["url"])
-                else:
-                    st.caption(
-                        f"{current_ep['label']} — ❌ Failed to process subtitle format."
-                    )
-                    st.video(current_ep["url"])
+                    raw_sub_text = fetch_subtitle_content(sub_url)
+                st.caption(
+                    f"{current_ep['label']} — ✅ Subtitles Loaded"
+                    if raw_sub_text
+                    else f"{current_ep['label']} — ❌ Failed to load subtitles."
+                )
             else:
                 st.caption(f"{current_ep['label']} — ❌ No Subtitles Available")
-                st.video(current_ep["url"])
+
+            # Render custom HLS Player
+            render_custom_player(video_url, raw_sub_text)
+
+            st.divider()
+
+            # --- EXTERNAL APP DEEP LINKS (For Mobile Phones) ---
+            st.markdown("### 📱 Play in External App (Bypasses CORS)")
+            st.caption(
+                "If the web player above shows an error, tap one of these buttons on your phone to open the stream in your native media app."
+            )
+
+            # Generate Intent URLs
+            scheme = "https" if video_url.startswith("https") else "http"
+            url_no_scheme = video_url.replace(f"{scheme}://", "")
+
+            # Subtitle parameter for MPV intent
+            sub_param = f";S.subs={quote(sub_url)}" if sub_url else ""
+
+            intent_vlc = f"vlc://{video_url}"
+            intent_mpv = f"intent://{url_no_scheme}#Intent;scheme={scheme};package=is.xyz.mpv;action=android.intent.action.VIEW{sub_param};end"
+            intent_mx = f"intent://{url_no_scheme}#Intent;scheme={scheme};package=com.mxtech.videoplayer.ad;action=android.intent.action.VIEW;end"
+            intent_chooser = f"intent://{url_no_scheme}#Intent;scheme={scheme};action=android.intent.action.VIEW;type=video/*;end"
+
+            st.markdown(
+                f"""
+            <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
+                <a href="{intent_vlc}" style="background-color: #FF8800; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟠 Open in VLC (iOS/Android)</a>
+                <a href="{intent_mpv}" style="background-color: #3E3B51; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟣 Open in MPV (Android)</a>
+                <a href="{intent_mx}" style="background-color: #1A73E8; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🔵 Open in MX Player</a>
+                <a href="{intent_chooser}" style="background-color: #4CAF50; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟢 Choose App</a>
+            </div>
+            """,
+                unsafe_allow_html=True,
+            )
 
         elif platform in ["1", "2", "3"]:
-            st.caption(f"{current_ep['label']} — Subtitle Link Attached")
+            st.caption(f"{current_ep['label']} — Ready for Local Execution")
             player_name = (
                 selected_platform_name.split()[1].replace("(", "").replace(")", "")
             )
             if st.button(
-                f"🎬 Launch {player_name} Native Player", use_container_width=True
+                f"🎬 Execute {player_name} Command on Host Device",
+                use_container_width=True,
             ):
-                play_video(current_ep["url"], current_ep["sub"], platform)
-                st.success(f"Sent to {player_name}!")
+                play_video_native_local(video_url, sub_url, platform)
+                st.success(f"Command executed on server for {player_name}!")
 
         elif platform == "4":
             st.code(
-                f"Video URL: {current_ep['url']}\nSubtitle URL: {current_ep['sub'] if current_ep['sub'] else 'None'}",
+                f"Video URL: {video_url}\nSubtitle URL: {sub_url if sub_url else 'None'}",
                 language="http",
             )
 
