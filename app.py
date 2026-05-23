@@ -18,7 +18,7 @@ except ImportError:
     HAS_KEYUP = False
 
 # --- Configuration & Metadata ---
-VERSION = "0.0.9 (Mobile Deep Links Edition)"
+VERSION = "0.0.9 (Mobile Deep Links & Smart Fallback Edition)"
 BASE_URL = "https://kisskh.buzz/"
 AJAX_URL = BASE_URL + "wp-admin/admin-ajax.php"
 BLOGGER_BLOG_ID = "1422331367239821646"
@@ -55,7 +55,7 @@ def srt_to_vtt(subtitle_text):
     return vtt
 
 
-def render_custom_player(video_url, subtitle_text=None):
+def render_custom_player(video_url, subtitle_text=None, fallback_url=""):
     sub_track_js = ""
     if subtitle_text:
         vtt_text = srt_to_vtt(subtitle_text)
@@ -78,43 +78,72 @@ def render_custom_player(video_url, subtitle_text=None):
     <head>
         <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
         <style>
-            body {{ margin: 0; background: #0e1117; color: white; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }}
+            body {{ margin: 0; background: #0e1117; color: white; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }}
             video {{ width: 100%; height: 100%; max-height: 100vh; outline: none; border-radius: 8px; }}
-            #error-msg {{ display: none; color: #ff4b4b; font-family: sans-serif; padding: 20px; text-align: center; line-height: 1.5; }}
+            #error-container {{ display: none; width: 100%; height: 100%; flex-direction: column; }}
+            #error-msg {{ background: #ff4b4b; color: white; font-family: sans-serif; padding: 12px; text-align: center; font-size: 15px; line-height: 1.5; }}
+            iframe {{ width: 100%; height: 100%; border: none; flex-grow: 1; background: #0e1117; }}
         </style>
     </head>
     <body>
-        <div id="error-msg">
-            <b>⚠️ Video Blocked by Server (CORS Error)</b><br><br>
-            The host server prevents this video from playing inside the web browser.<br><br>
-            👇 <b>Scroll down to the "Play in External App" section to open it directly!</b> 👇
-        </div>
         <video id="video" controls crossorigin="anonymous" playsinline></video>
+        
+        <!-- Fallback Container -->
+        <div id="error-container">
+            <div id="error-msg">
+                <b>⚠️ Direct Video Blocked by Server (CORS Error)</b><br>
+                Loading the website's original embedded player as a fallback...
+            </div>
+            <iframe id="fallback-iframe" allowfullscreen="true" allow="autoplay; fullscreen" scrolling="yes"></iframe>
+        </div>
+
         <script>
             var video = document.getElementById('video');
+            var errorContainer = document.getElementById('error-container');
+            var fallbackIframe = document.getElementById('fallback-iframe');
+            
             var videoSrc = "{video_url}";
+            var fallbackUrl = "{fallback_url}";
+            
             {sub_track_js}
-            if (Hls.isSupported() && videoSrc.includes('.m3u8')) {{
+            
+            function showFallback() {{
+                video.style.display = 'none';
+                errorContainer.style.display = 'flex';
+                if (fallbackUrl) {{
+                    fallbackIframe.src = fallbackUrl;
+                }}
+            }}
+
+            // Smart Check: If the URL is a third-party embed link (not a media file), instantly show it in the iframe
+            var isStream = videoSrc.includes('.m3u8') || videoSrc.includes('.mp4');
+            
+            if (!isStream) {{
+                fallbackUrl = videoSrc; // Override to embed the provided link directly
+                document.getElementById('error-msg').style.display = 'none'; // Hide error msg since this is intentional
+                showFallback();
+            }} else if (Hls.isSupported() && videoSrc.includes('.m3u8')) {{
                 var hls = new Hls();
                 hls.loadSource(videoSrc);
                 hls.attachMedia(video);
                 hls.on(Hls.Events.ERROR, function (event, data) {{
                     if (data.fatal) {{
-                        document.getElementById('video').style.display = 'none';
-                        document.getElementById('error-msg').style.display = 'block';
+                        showFallback();
                     }}
                 }});
             }} else if (video.canPlayType('application/vnd.apple.mpegurl') || !videoSrc.includes('.m3u8')) {{
                 video.src = videoSrc;
+                video.onerror = function() {{
+                    showFallback();
+                }};
             }} else {{
-                document.getElementById('video').style.display = 'none';
-                document.getElementById('error-msg').style.display = 'block';
+                showFallback();
             }}
         </script>
     </body>
     </html>
     """
-    components.html(html_code, height=500)
+    components.html(html_code, height=650)
 
 
 @st.cache_data(show_spinner=False)
@@ -221,6 +250,10 @@ def fetch_subtitle_content(url):
 def play_video_native_local(url, sub_url, platform):
     if not url:
         return
+
+    # 🔥 Required to bypass server blocks on some hosts!
+    referer = "https://kisskh.buzz/"
+
     try:
         if platform == "1":
             cmd = [
@@ -233,7 +266,7 @@ def play_video_native_local(url, sub_url, platform):
                 "-d",
                 url,
                 "-n",
-                "io.mpv/.MPVActivity",
+                "is.xyz.mpv/.MPVActivity",
             ]
             if sub_url:
                 cmd.extend(["--es", "subs", sub_url])
@@ -241,7 +274,8 @@ def play_video_native_local(url, sub_url, platform):
         elif platform == "2":
             os.system(f"open vlc://{url}")
         elif platform == "3":
-            cmd = ["mpv", url]
+            # Native Local MPV on PC safely passes Referer headers
+            cmd = ["mpv", url, f"--http-header-fields=Referer: {referer}"]
             if sub_url:
                 cmd.append(f"--sub-file={sub_url}")
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -360,7 +394,7 @@ def main():
         sub_url = current_ep["sub"]
 
         if platform == "0":
-            # NATIVE BROWSER PLAYER (With HLS support)
+            # NATIVE BROWSER PLAYER (With HLS support & Fallback Website Iframe)
             raw_sub_text = None
             if sub_url:
                 with st.spinner("Downloading subtitles..."):
@@ -373,13 +407,20 @@ def main():
             else:
                 st.caption(f"{current_ep['label']} — ❌ No Subtitles Available")
 
-            # Render custom HLS Player
-            render_custom_player(video_url, raw_sub_text)
+            # Render custom HLS Player (Passing the original website link as a fallback)
+            render_custom_player(
+                video_url, raw_sub_text, fallback_url=selected_drama["link"]
+            )
 
             st.divider()
+
             # --- EXTERNAL APP DEEP LINKS (For Mobile Phones) ---
             st.markdown("### 📱 Play in External App (Bypasses CORS)")
+            st.caption(
+                "If the web player above shows an error, tap one of these buttons on your phone to open the stream in your native media app."
+            )
 
+            # 1. Clean the URL and extract the scheme
             clean_video_url = video_url.strip().replace(" ", "%20")
 
             # 🔥 BYPASS TRICK: Append the Referer so servers don't block the stream
@@ -389,6 +430,9 @@ def main():
             scheme = "https" if clean_video_url.startswith("https") else "http"
             url_no_scheme = referer_url.replace(f"{scheme}://", "")
 
+            # 2. Set MIME types securely
+            # VLC & MX Player need specific MIME types for m3u8.
+            # MPV strictly requires 'video/*' or Android rejects the intent and opens the Play Store.
             mime_type = (
                 "application/x-mpegURL"
                 if ".m3u8" in clean_video_url.lower()
@@ -396,21 +440,28 @@ def main():
             )
             mpv_mime_type = "video/*"
 
+            # 3. Escape ampersands for HTML to prevent query parameters from corrupting the intent link
             html_url_no_scheme = url_no_scheme.replace("&", "&amp;")
+
+            # 4. Subtitle parameter for MPV intent
             sub_param = f";S.subs={quote(sub_url.strip())}" if sub_url else ""
 
+            # 5. Build Intent URIs correctly
             intent_vlc_android = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=org.videolan.vlc;action=android.intent.action.VIEW;type={mime_type};end"
             intent_vlc_ios = (
                 f"vlc-x-callback://x-callback-url/stream?url={quote(clean_video_url)}"
             )
             intent_mpv = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=is.xyz.mpv;action=android.intent.action.VIEW;type={mpv_mime_type}{sub_param};end"
             intent_mx = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=com.mxtech.videoplayer.ad;action=android.intent.action.VIEW;type={mime_type};end"
+
+            # Chooser intent (Note: If it automatically opens an app, clear that app's defaults in Android Settings)
             intent_chooser = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};action=android.intent.action.VIEW;type={mime_type};end"
 
             st.markdown(
                 f"""
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
                 <a href="{intent_vlc_android}" style="background-color: #FF8800; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟠 VLC (Android)</a>
+                <a href="{intent_vlc_ios}" style="background-color: #FF8800; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟠 VLC (iOS)</a>
                 <a href="{intent_mpv}" style="background-color: #3E3B51; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟣 MPV (Android)</a>
                 <a href="{intent_mx}" style="background-color: #1A73E8; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🔵 MX Player</a>
                 <a href="{intent_chooser}" style="background-color: #4CAF50; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟢 Choose App</a>
@@ -418,6 +469,7 @@ def main():
             """,
                 unsafe_allow_html=True,
             )
+
         elif platform in ["1", "2", "3"]:
             st.caption(f"{current_ep['label']} — Ready for Local Execution")
             player_name = (
