@@ -384,24 +384,40 @@ def main():
                 "If the web player above shows an error, tap one of these buttons on your phone to open the stream in your native media app."
             )
 
-            # Generate Intent URLs
-            scheme = "https" if video_url.startswith("https") else "http"
-            url_no_scheme = video_url.replace(f"{scheme}://", "")
+            # 1. Clean the URL and extract the scheme
+            clean_video_url = video_url.strip().replace(" ", "%20")
+            scheme = "https" if clean_video_url.startswith("https") else "http"
+            url_no_scheme = clean_video_url.replace(f"{scheme}://", "")
 
-            # Subtitle parameter for MPV intent
-            sub_param = f";S.subs={quote(sub_url)}" if sub_url else ""
+            # 2. Crucial: Determine MIME type so players don't throw playback errors
+            mime_type = (
+                "application/x-mpegURL"
+                if ".m3u8" in clean_video_url.lower()
+                else "video/*"
+            )
 
-            intent_vlc = f"vlc://{video_url}"
-            intent_mpv = f"intent://{url_no_scheme}#Intent;scheme={scheme};package=is.xyz.mpv;action=android.intent.action.VIEW{sub_param};end"
-            intent_mx = f"intent://{url_no_scheme}#Intent;scheme={scheme};package=com.mxtech.videoplayer.ad;action=android.intent.action.VIEW;end"
-            intent_chooser = f"intent://{url_no_scheme}#Intent;scheme={scheme};action=android.intent.action.VIEW;type=video/*;end"
+            # 3. Escape ampersands for HTML to prevent query parameters from corrupting the intent link
+            html_url_no_scheme = url_no_scheme.replace("&", "&amp;")
+
+            # 4. Subtitle parameter for MPV intent
+            sub_param = f";S.subs={quote(sub_url.strip())}" if sub_url else ""
+
+            # 5. Build Intent URIs correctly
+            intent_vlc_android = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=org.videolan.vlc;action=android.intent.action.VIEW;type={mime_type};end"
+            intent_vlc_ios = (
+                f"vlc-x-callback://x-callback-url/stream?url={quote(clean_video_url)}"
+            )
+            intent_mpv = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=is.xyz.mpv;action=android.intent.action.VIEW;type={mime_type}{sub_param};end"
+            intent_mx = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};package=com.mxtech.videoplayer.ad;action=android.intent.action.VIEW;type={mime_type};end"
+            intent_chooser = f"intent://{html_url_no_scheme}#Intent;scheme={scheme};action=android.intent.action.VIEW;type={mime_type};end"
 
             st.markdown(
                 f"""
             <div style="display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px;">
-                <a href="{intent_vlc}" style="background-color: #FF8800; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟠 Open in VLC (iOS/Android)</a>
-                <a href="{intent_mpv}" style="background-color: #3E3B51; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟣 Open in MPV (Android)</a>
-                <a href="{intent_mx}" style="background-color: #1A73E8; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🔵 Open in MX Player</a>
+                <a href="{intent_vlc_android}" style="background-color: #FF8800; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟠 VLC (Android)</a>
+                <a href="{intent_vlc_ios}" style="background-color: #FF8800; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟠 VLC (iOS)</a>
+                <a href="{intent_mpv}" style="background-color: #3E3B51; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟣 MPV (Android)</a>
+                <a href="{intent_mx}" style="background-color: #1A73E8; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🔵 MX Player</a>
                 <a href="{intent_chooser}" style="background-color: #4CAF50; color: white; padding: 12px 20px; border-radius: 8px; text-decoration: none; font-weight: bold;">🟢 Choose App</a>
             </div>
             """,
